@@ -312,109 +312,169 @@ def create_api_app() -> FastAPI:
         query: str = Query(..., description="Search term"),
         page: int = Query(1, ge=1, description="Page number (1-based)"),
         per_page: int = Query(250, ge=1, le=10000, description="Items per page (max 10000)"),
+        sort: str = Query("stored", description="Sort mode (stored, abc, zyx, new, old, pubnew, pubold, authaz, authza)"),
         include_authors: bool = Query(False, description="Include resolved author names for each book"),
     ) -> ListBooksResponse:
-        import re
-        from sqlalchemy import and_, or_, text, func
-        from sqlalchemy.orm import selectinload
-
         from . import db
         from . import config
         from . import calibre_db
+        from . import ub
+        from .cw_login import current_user
         from .string_helper import strip_whitespaces
+        from sqlalchemy import create_engine
+        from sqlalchemy import text
 
-        term = strip_whitespaces(query).lower()
+        term = strip_whitespaces(query)
         if not term:
             return {"page": page, "per_page": per_page, "total": 0, "items": []}
 
         offset = (page - 1) * per_page
+        join = db.books_series_link, db.Books.id == db.books_series_link.c.book, db.Series
+
+        sort_param = strip_whitespaces(sort).lower() if sort else "stored"
+        order_by = [db.Books.sort]
+        if sort_param == "pubnew":
+            order_by = [db.Books.pubdate.desc()]
+        if sort_param == "pubold":
+            order_by = [db.Books.pubdate]
+        if sort_param == "abc":
+            order_by = [db.Books.sort]
+        if sort_param == "zyx":
+            order_by = [db.Books.sort.desc()]
+        if sort_param == "new":
+            order_by = [db.Books.timestamp.desc()]
+        if sort_param == "old":
+            order_by = [db.Books.timestamp]
+        if sort_param == "authaz":
+            order_by = [db.Books.author_sort.asc(), db.Series.name, db.Books.series_index]
+        if sort_param == "authza":
+            order_by = [db.Books.author_sort.desc(), db.Series.name.desc(), db.Books.series_index.desc()]
+        order = [order_by, sort_param]
 
         with _flask_request_context("/search", {"query": term}):
-            calibre_db.create_functions()
-            session = calibre_db.session
-
             fts_ids = None
-            if not hasattr(calibre_db, "_fts_available"):
-                try:
-                    result = session.execute(
-                        text("SELECT name FROM sqlite_master WHERE type='table' AND name='books_fts'")
-                    ).fetchone()
-                    calibre_db._fts_available = result is not None
-                except Exception:
-                    calibre_db._fts_available = False
+            fts_query = None
+            fts_term = strip_whitespaces(term)
+            if fts_term:
+                tokens = [token for token in fts_term.split() if token]
+                if tokens:
+                    escaped_tokens = [f'"{token.replace("\"", "\"\"")}"' for token in tokens]
+                    fts_query = " AND ".join(escaped_tokens)
+                else:
+                    fts_query = fts_term
 
-            if calibre_db._fts_available:
+            fts_db_path = None
+            if config.config_calibre_dir:
+                fts_db_path = os.path.join(config.config_calibre_dir, "full-text-search.db")
+
+            if config.config_fulltext_search and fts_query and fts_db_path and os.path.exists(fts_db_path):
                 try:
-                    term_fts = term.replace('"', '""')
-                    fts_results = session.execute(
-                        text("SELECT DISTINCT rowid FROM books_fts WHERE books_fts MATCH :term"),
-                        {"term": f'"{term_fts}"'},
-                    ).fetchall()
-                    if fts_results:
-                        fts_ids = [row[0] for row in fts_results]
+                    fts_engine = create_engine(
+                        f"sqlite:///{fts_db_path}",
+                        echo=False,
+                        connect_args={"check_same_thread": False},
+                    )
+                    try:
+                        with fts_engine.connect() as fts_conn:
+                            try:
+                                try:
+                                    raw_conn = fts_conn.connection.driver_connection
+                                except AttributeError:
+                                    raw_conn = fts_conn.connection
+                                raw_conn.load_extension("/app/calibre/lib/calibre-extensions/sqlite_extension.so")
+                                raw_conn.enable_load_extension(False)
+                            except Exception:
+                                pass
+
+                            fts_rows = fts_conn.execute(
+                                text("""
+                                    SELECT DISTINCT books_text.book
+                                    FROM books_fts_stemmed
+                                    JOIN books_text ON books_text.id = books_fts_stemmed.rowid
+                                    WHERE books_fts_stemmed MATCH :term
+                                    ORDER BY rank
+                                """),
+                                {"term": fts_query},
+                            ).fetchall()
+                            if fts_rows:
+                                fts_ids = list(dict.fromkeys(row[0] for row in fts_rows))
+                    finally:
+                        fts_engine.dispose()
                 except Exception:
-                    # FTS can fail for malformed terms; fallback query below handles this.
                     fts_ids = None
 
-            books_query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
-            books_query = books_query.filter(calibre_db.common_filters(True))
-            books_query = books_query.options(selectinload(db.Books.authors))
-
             if fts_ids:
-                books_query = books_query.filter(db.Books.id.in_(fts_ids))
-            else:
-                author_terms = re.split("[, ]+", term)
-                author_subquery = session.query(db.books_authors_link.c.book).join(
-                    db.Authors, db.books_authors_link.c.author == db.Authors.id
+                has_explicit_order = bool(sort_param and sort_param != "stored")
+
+                base_entries = []
+                if config.config_merge_search:
+                    base_entries, _, _ = calibre_db.get_search_results(
+                        term, config, offset, order, per_page, *join
+                    )
+
+                fts_db_query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
+                fts_db_query = (
+                    fts_db_query.outerjoin(db.books_series_link, db.Books.id == db.books_series_link.c.book)
+                    .outerjoin(db.Series)
+                    .filter(db.Books.id.in_(fts_ids))
                 )
-                author_filters = [
-                    func.lower(db.Authors.name).ilike("%" + author_term + "%")
-                    for author_term in author_terms
-                    if author_term
-                ]
-                if author_filters:
-                    author_subquery = author_subquery.filter(and_(*author_filters))
 
-                cc = calibre_db.get_cc_columns(config, filter_config_custom_read=True)
-                filter_expression = [
-                    db.Books.id.in_(
-                        session.query(db.books_tags_link.c.book)
-                        .join(db.Tags, db.books_tags_link.c.tag == db.Tags.id)
-                        .filter(func.lower(db.Tags.name).ilike("%" + term + "%"))
-                    ),
-                    db.Books.id.in_(
-                        session.query(db.books_series_link.c.book)
-                        .join(db.Series, db.books_series_link.c.series == db.Series.id)
-                        .filter(func.lower(db.Series.name).ilike("%" + term + "%"))
-                    ),
-                    db.Books.id.in_(author_subquery),
-                    db.Books.id.in_(
-                        session.query(db.books_publishers_link.c.book)
-                        .join(db.Publishers, db.books_publishers_link.c.publisher == db.Publishers.id)
-                        .filter(func.lower(db.Publishers.name).ilike("%" + term + "%"))
-                    ),
-                    func.lower(db.Books.title).ilike("%" + term + "%"),
-                ]
+                if has_explicit_order:
+                    fts_db_query = fts_db_query.order_by(*order_by)
 
-                for c in cc:
-                    if c.datatype not in ["datetime", "rating", "bool", "int", "float"]:
-                        filter_expression.append(
-                            getattr(db.Books, "custom_column_" + str(c.id)).any(
-                                func.lower(db.cc_classes[c.id].value).ilike("%" + term + "%")
-                            )
+                fts_result = fts_db_query.all()
+                if has_explicit_order:
+                    fts_result_ordered = fts_result
+                else:
+                    fts_by_id = {row.Books.id: row for row in fts_result}
+                    fts_result_ordered = [fts_by_id[book_id] for book_id in fts_ids if book_id in fts_by_id]
+
+                ub.store_combo_ids(fts_result_ordered)
+                fts_entries = calibre_db.order_authors(fts_result_ordered, list_return=True, combined=True)
+
+                archived_book_ids = set()
+                try:
+                    if getattr(config, "config_hide_archived_search", True):
+                        archived_books = (
+                            ub.session.query(ub.ArchivedBook)
+                            .filter(ub.ArchivedBook.user_id == int(current_user.id))
+                            .filter(ub.ArchivedBook.is_archived == True)
+                            .all()
                         )
+                        archived_book_ids = set(ab.book_id for ab in archived_books)
+                except Exception:
+                    archived_book_ids = set()
 
-                books_query = books_query.filter(or_(*filter_expression))
+                def _get_book_id(entry):
+                    if hasattr(entry, "Books") and getattr(entry, "Books") is not None:
+                        return getattr(entry.Books, "id", None)
+                    return getattr(entry, "id", None)
 
-            total = books_query.count()
-            rows = (
-                books_query.order_by(db.Books.sort)
-                .offset(offset)
-                .limit(per_page)
-                .all()
-            )
+                merged = []
+                seen_ids = set()
+                for item in (base_entries or []):
+                    book_id = _get_book_id(item)
+                    if book_id is not None and book_id in archived_book_ids:
+                        continue
+                    if book_id is None or book_id not in seen_ids:
+                        if book_id is not None:
+                            seen_ids.add(book_id)
+                        merged.append(item)
+                for item in (fts_entries or []):
+                    book_id = _get_book_id(item)
+                    if book_id is not None and book_id in archived_book_ids:
+                        continue
+                    if book_id is None or book_id not in seen_ids:
+                        if book_id is not None:
+                            seen_ids.add(book_id)
+                        merged.append(item)
 
-            entries = calibre_db.order_authors(rows, list_return=True, combined=True)
+                total = len(merged)
+                entries = merged[offset:offset + per_page]
+            else:
+                entries, total, _ = calibre_db.get_search_results(
+                    term, config, offset, order, per_page, *join
+                )
 
         items = []
         for entry in entries:
