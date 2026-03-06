@@ -26,6 +26,7 @@ small ASGI->WSGI adapter (see `cps/asgi_wsgi.py`).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import traceback
 
@@ -86,6 +87,18 @@ def create_api_app() -> FastAPI:
             return calibre_db.session
         finally:
             # Session will be closed by CalibreDB teardown when the context pops.
+            ctx.pop()
+
+    @contextmanager
+    def _flask_request_context(path: str, query_string: dict[str, str] | None = None):
+        """Provide a Flask request context for code that depends on `current_user`."""
+        from . import app as flask_app
+
+        ctx = flask_app.test_request_context(path=path, query_string=query_string or {})
+        ctx.push()
+        try:
+            yield
+        finally:
             ctx.pop()
 
     # --- Simple per-IP rate limiting (requests per minute) ---
@@ -282,6 +295,153 @@ def create_api_app() -> FastAPI:
                 for b in items
             ],
         }
+
+    @api.get(
+        "/search",
+        tags=["library"],
+        summary="Search books",
+        description=(
+            "Searches books using the same Calibre DB strategy implemented for main search "
+            "(FTS5 first, then SQL fallback).\n\n"
+            "Use `query` as the search term and `page`/`per_page` for pagination."
+        ),
+        response_model=ListBooksResponse,
+        dependencies=[Depends(require_api_token)],
+    )
+    def search_books(
+        query: str = Query(..., description="Search term"),
+        page: int = Query(1, ge=1, description="Page number (1-based)"),
+        per_page: int = Query(250, ge=1, le=10000, description="Items per page (max 10000)"),
+        include_authors: bool = Query(False, description="Include resolved author names for each book"),
+    ) -> ListBooksResponse:
+        import re
+        from sqlalchemy import and_, or_, text, func
+        from sqlalchemy.orm import selectinload
+
+        from . import db
+        from . import config
+        from . import calibre_db
+        from .string_helper import strip_whitespaces
+
+        term = strip_whitespaces(query).lower()
+        if not term:
+            return {"page": page, "per_page": per_page, "total": 0, "items": []}
+
+        offset = (page - 1) * per_page
+
+        with _flask_request_context("/search", {"query": term}):
+            calibre_db.create_functions()
+            session = calibre_db.session
+
+            fts_ids = None
+            if not hasattr(calibre_db, "_fts_available"):
+                try:
+                    result = session.execute(
+                        text("SELECT name FROM sqlite_master WHERE type='table' AND name='books_fts'")
+                    ).fetchone()
+                    calibre_db._fts_available = result is not None
+                except Exception:
+                    calibre_db._fts_available = False
+
+            if calibre_db._fts_available:
+                try:
+                    term_fts = term.replace('"', '""')
+                    fts_results = session.execute(
+                        text("SELECT DISTINCT rowid FROM books_fts WHERE books_fts MATCH :term"),
+                        {"term": f'"{term_fts}"'},
+                    ).fetchall()
+                    if fts_results:
+                        fts_ids = [row[0] for row in fts_results]
+                except Exception:
+                    # FTS can fail for malformed terms; fallback query below handles this.
+                    fts_ids = None
+
+            books_query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
+            books_query = books_query.filter(calibre_db.common_filters(True))
+            books_query = books_query.options(selectinload(db.Books.authors))
+
+            if fts_ids:
+                books_query = books_query.filter(db.Books.id.in_(fts_ids))
+            else:
+                author_terms = re.split("[, ]+", term)
+                author_subquery = session.query(db.books_authors_link.c.book).join(
+                    db.Authors, db.books_authors_link.c.author == db.Authors.id
+                )
+                author_filters = [
+                    func.lower(db.Authors.name).ilike("%" + author_term + "%")
+                    for author_term in author_terms
+                    if author_term
+                ]
+                if author_filters:
+                    author_subquery = author_subquery.filter(and_(*author_filters))
+
+                cc = calibre_db.get_cc_columns(config, filter_config_custom_read=True)
+                filter_expression = [
+                    db.Books.id.in_(
+                        session.query(db.books_tags_link.c.book)
+                        .join(db.Tags, db.books_tags_link.c.tag == db.Tags.id)
+                        .filter(func.lower(db.Tags.name).ilike("%" + term + "%"))
+                    ),
+                    db.Books.id.in_(
+                        session.query(db.books_series_link.c.book)
+                        .join(db.Series, db.books_series_link.c.series == db.Series.id)
+                        .filter(func.lower(db.Series.name).ilike("%" + term + "%"))
+                    ),
+                    db.Books.id.in_(author_subquery),
+                    db.Books.id.in_(
+                        session.query(db.books_publishers_link.c.book)
+                        .join(db.Publishers, db.books_publishers_link.c.publisher == db.Publishers.id)
+                        .filter(func.lower(db.Publishers.name).ilike("%" + term + "%"))
+                    ),
+                    func.lower(db.Books.title).ilike("%" + term + "%"),
+                ]
+
+                for c in cc:
+                    if c.datatype not in ["datetime", "rating", "bool", "int", "float"]:
+                        filter_expression.append(
+                            getattr(db.Books, "custom_column_" + str(c.id)).any(
+                                func.lower(db.cc_classes[c.id].value).ilike("%" + term + "%")
+                            )
+                        )
+
+                books_query = books_query.filter(or_(*filter_expression))
+
+            total = books_query.count()
+            rows = (
+                books_query.order_by(db.Books.sort)
+                .offset(offset)
+                .limit(per_page)
+                .all()
+            )
+
+            entries = calibre_db.order_authors(rows, list_return=True, combined=True)
+
+        items = []
+        for entry in entries:
+            book = getattr(entry, "Books", None)
+            if book is None and isinstance(entry, (list, tuple)) and entry:
+                book = entry[0]
+            if book is None:
+                book = entry
+
+            item = {
+                "id": book.id,
+                "title": book.title,
+                "sort": book.sort,
+                "author_sort": book.author_sort,
+                "timestamp": book.timestamp.isoformat() if book.timestamp else None,
+                "pubdate": book.pubdate.isoformat() if book.pubdate else None,
+                "last_modified": book.last_modified.isoformat() if book.last_modified else None,
+                "path": book.path,
+                "has_cover": bool(book.has_cover),
+                "uuid": book.uuid,
+            }
+            if include_authors:
+                item["authors"] = [a.name for a in (book.authors or [])]
+            items.append(item)
+
+        return {"page": page, "per_page": per_page, "total": total, "items": items}
+
     @api.get(
         "/series",
         tags=["library"],
